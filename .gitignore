@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Java / Maven (fallback ngoai .gitignore rieng cua tung project trong Code/)
+target/
+*.class
+
+# Python cache (tu cac script trong .claude/skills)
+__pycache__/
+*.pyc

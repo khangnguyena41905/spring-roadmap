@@ -1,0 +1,155 @@
+# Lộ trình 1 tuần: API, Security, CQRS/DDD, RabbitMQ, Docker/K8s
+
+**Giả định:** 3 giờ mỗi ngày. Mình hiểu "AO2" là **OAuth2**. Cả tuần làm **một dự án duy nhất**: _Shipment Service_ (quản lý vận đơn), mỗi ngày thêm một lớp vào đó.
+
+## Tổng quan
+
+| Ngày  | Mục tiêu                                      | Sản phẩm cuối ngày                          |
+| ----- | --------------------------------------------- | ------------------------------------------- |
+| 1     | Khung API chuẩn + DB + giao diện test API     | CRUD chạy được, có Swagger UI               |
+| 2     | JWT + Spring Security + Filter/Interceptor    | Login, cấp token, bảo vệ endpoint           |
+| 3     | OAuth2 + bắt đầu DDD                          | Resource server (Keycloak) + domain model   |
+| 4     | CQRS + Migration + Pub/Sub                    | Command/Query handler, Flyway, domain event |
+| 5     | RabbitMQ + tính năng tạo vận đơn giờ cao điểm | Luồng tạo vận đơn bất đồng bộ               |
+| 6     | Chống mất tin + test tải                      | Outbox, confirms, DLQ, idempotent consumer  |
+| 7     | Docker + Kubernetes                           | Chạy toàn bộ stack trên K8s local           |
+| Bonus | Microservice + CI/CD                          | Tách service, pipeline build/test/deploy    |
+
+## Ngày 1: Khung API chuẩn, database, giao diện test
+
+**Học**
+
+- Cấu trúc package (theo tầng hoặc theo feature), Spring DI, `@RestController`.
+- Chuẩn API: DTO tách khỏi entity, `@ControllerAdvice` cho lỗi thống nhất (mẫu `ProblemDetail`), Jakarta Validation, phân trang, mã HTTP (200/201/204/400/404/409).
+- Kết nối DB: `application.yml` theo profile, HikariCP, Spring Data JPA.
+- Giao diện test: **springdoc-openapi (Swagger UI)**. Ngoài ra dùng thêm `.http` file của IDE hoặc Postman.
+
+**Làm:** Spring Initializr (Java 21, Web, JPA, Validation, Postgres/SQL Server driver), Docker Compose chạy DB, CRUD `Shipment`, mở được Swagger UI ở `/swagger-ui.html`.
+
+**Đối chiếu .NET:** Swashbuckle ↔ springdoc, `IOptions` ↔ `@ConfigurationProperties`.
+
+**Xong khi:** gọi CRUD qua Swagger, lỗi trả về đúng một định dạng.
+
+## Ngày 2: JWT, Spring Security, Filter/Interceptor
+
+**Học**
+
+- Luồng Spring Security: `SecurityFilterChain`, `AuthenticationManager`, `UserDetailsService`, `SecurityContext`.
+- JWT: cấu trúc, HS256 vs RS256, expiry, refresh token.
+- **"Middleware" trong Spring** không có một khái niệm duy nhất, mà có 3 tầng:
+  - **`OncePerRequestFilter`** (servlet filter): gần middleware ASP.NET nhất, dùng cho JWT filter, correlation ID, logging request.
+  - **`HandlerInterceptor`**: chạy quanh controller, biết handler nào đang được gọi.
+  - **AOP (`@Aspect`)**: chạy quanh method, dùng cho audit, metrics.
+- CORS, tắt CSRF cho REST API.
+
+**Làm:** endpoint `/auth/login` cấp access + refresh token, `JwtAuthenticationFilter` tự viết, một custom filter gắn `X-Correlation-Id` vào MDC log, một interceptor đo thời gian request.
+
+**Xong khi:** gọi endpoint bảo vệ không có token trả 401, sai quyền trả 403.
+
+## Ngày 3: OAuth2 + bắt đầu DDD
+
+**Buổi 1: OAuth2 (khoảng 1,5 giờ)**
+
+- Authorization Code flow, scope/claim, Resource Server.
+- Chạy **Keycloak** bằng Docker, cấu hình `spring-boot-starter-oauth2-resource-server` để API xác thực token do Keycloak cấp.
+- Method security: `@PreAuthorize`, phân biệt role và authority.
+
+**Buổi 2: DDD (khoảng 1,5 giờ)**
+
+- Aggregate root, entity, value object, domain service, repository theo domain.
+- Tổ chức package theo bounded context, dùng `record` cho value object, `@Embeddable` khi lưu JPA.
+
+**Làm:** thiết kế aggregate `Shipment` (trạng thái `PENDING → CONFIRMED → IN_TRANSIT → DELIVERED`, value object `Address`, `TrackingCode`), đặt luật nghiệp vụ trong aggregate thay vì trong service.
+
+## Ngày 4: CQRS, Migration, Pub/Sub
+
+**Học**
+
+- **CQRS nhẹ, không cần framework:** mỗi command/query là một `record`, mỗi handler là một `@Service`. `@Transactional` đặt ở command handler đóng vai trò như pipeline behavior của MediatR, validation gắn ở tầng trước handler.
+- **Migration:** Flyway (`V1__`, `R__`), checksum, quy tắc "không sửa migration đã chạy", chiến lược khi migration lỗi trên production (viết migration mới để sửa, không rollback tay).
+- **Pub/Sub:** khái niệm publisher/subscriber, khác biệt với point-to-point queue. Trước tiên làm **in-process** bằng `ApplicationEventPublisher` và `@DomainEvents`/`AbstractAggregateRoot`, rồi mới đẩy ra broker ở ngày 5.
+- Tùy chọn: Spring Modulith nếu muốn ranh giới module rõ hơn.
+
+**Làm:** `CreateShipmentCommandHandler`, `GetShipmentQueryHandler`, aggregate phát `ShipmentCreated`, một listener xử lý event trong cùng process, toàn bộ schema đưa vào Flyway.
+
+## Ngày 5: RabbitMQ và tính năng tạo vận đơn giờ cao điểm
+
+**Bài toán:** giờ cao điểm có hàng nghìn request tạo vận đơn cùng lúc. Ý tưởng là API **nhận nhanh, xử lý sau**, dùng queue làm bộ đệm.
+
+**Luồng đề xuất**
+
+1. `POST /shipments` → validate → lưu vận đơn trạng thái `PENDING` → trả **202 Accepted** kèm id.
+2. Publish message `CreateShipment` lên RabbitMQ.
+3. Consumer xử lý nặng (cấp mã vận đơn, gán hãng vận chuyển, tính phí) rồi cập nhật trạng thái.
+4. Client kiểm tra bằng `GET /shipments/{id}` (hoặc nhận thông báo).
+
+**Học**
+
+- Exchange (direct/topic/fanout), queue, binding, routing key.
+- Spring AMQP: `RabbitTemplate`, `@RabbitListener`, `Jackson2JsonMessageConverter`.
+- Điều chỉnh tải: `prefetch`, số consumer đồng thời (`concurrency`), nhiều instance cùng đọc một queue (competing consumers).
+
+**Làm:** Docker Compose thêm RabbitMQ (management UI ở cổng 15672), khai báo exchange/queue bằng code, producer và consumer chạy được.
+
+**Đối chiếu .NET:** MassTransit consumer ↔ `@RabbitListener`, `IPublishEndpoint` ↔ `RabbitTemplate`.
+
+## Ngày 6: Cơ chế chống mất tin và test tải
+
+Mất tin có thể xảy ra ở **3 điểm**, mỗi điểm cần một biện pháp:
+
+| Điểm có thể mất                                                         | Biện pháp                                                                                                                                                                                                               |
+| ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **App → Broker** (publish thất bại, DB commit xong nhưng chưa gửi được) | **Outbox pattern**: ghi event vào bảng `outbox` cùng transaction với dữ liệu, một relay đọc bảng rồi publish. Bật **publisher confirms** và **mandatory/returns** để biết broker đã nhận và message có route được không |
+| **Trong Broker** (broker restart)                                       | Exchange và queue **durable**, message **persistent**, cân nhắc **quorum queue**                                                                                                                                        |
+| **Broker → Consumer** (consumer chết giữa chừng)                        | **Manual ack**, chỉ ack sau khi DB commit thành công. Lỗi thì retry có giới hạn, quá số lần thì đưa vào **Dead-Letter Queue**                                                                                           |
+
+Kèm theo là **idempotent consumer**, vì cơ chế trên là _at-least-once_ nên message có thể đến hai lần. Dùng `messageId` và unique constraint (hoặc bảng `processed_messages`) để xử lý lặp không gây hậu quả.
+
+**Làm**
+
+- Bảng `outbox` + scheduled relay (thêm **ShedLock** để chỉ một instance chạy relay khi scale nhiều bản).
+- Bật confirms/returns, cấu hình retry + DLQ.
+- Thử phá hoại: dừng RabbitMQ giữa chừng, kill consumer khi đang xử lý, gửi trùng message, rồi kiểm tra không mất và không xử lý lặp.
+- **Test tải giờ cao điểm** bằng k6 hoặc JMeter: bắn nhiều request, quan sát độ dài queue trong management UI, chỉnh `prefetch` và `concurrency`.
+
+**Xong khi:** giết bất kỳ thành phần nào trong luồng, sau khi phục hồi, mọi vận đơn vẫn được xử lý đúng một lần về kết quả.
+
+## Ngày 7: Docker và Kubernetes
+
+**Buổi 1: Docker (khoảng 1 giờ, ôn tập)**
+
+- Dockerfile multi-stage cho Java, tối ưu layer cache, image nhỏ, chạy non-root.
+- Docker Compose cho toàn bộ stack (app, DB, RabbitMQ, Keycloak).
+
+**Buổi 2: Kubernetes (khoảng 2 giờ)**
+
+- Khái niệm: Pod, Deployment, Service, ConfigMap, Secret, Ingress.
+- Liveness/readiness probe nối với **Spring Boot Actuator** (`/actuator/health/liveness`, `/readiness`).
+- Cài **kind** hoặc **minikube**, deploy app và RabbitMQ, scale consumer lên nhiều replica để thấy competing consumers.
+- Kustomize overlay cho dev/stg.
+
+**Xong khi:** `kubectl apply` dựng được cả hệ thống, scale số pod consumer và thấy queue được xử lý nhanh hơn.
+
+## Bonus
+
+**Microservice** (khoảng 3 đến 4 giờ)
+
+- Tách thành **shipment-service** (nhận và lưu vận đơn) và **notification/carrier-service** (consumer), giao tiếp qua RabbitMQ.
+- Mỗi service có DB riêng, không truy cập chéo DB.
+- API Gateway (Spring Cloud Gateway hoặc NGINX), Resilience4j (circuit breaker, retry) cho các lời gọi đồng bộ.
+- Correlation ID xuyên suốt các service, tracing bằng OpenTelemetry.
+
+**CI/CD** (khoảng 2 đến 3 giờ, ví dụ với GitHub Actions)
+
+- CI: build Maven, chạy unit test và integration test (Testcontainers), quét lỗi tĩnh.
+- Build và push Docker image lên registry.
+- CD: deploy lên K8s bằng `kubectl`/Kustomize hoặc Helm, tách môi trường dev/stg.
+
+## Lưu ý thực tế
+
+- **Khối lượng lớn:** ngày 5 và 6 là quan trọng nhất và dễ trượt nhất. Nếu bị chậm, cắt ngắn OAuth2 (ngày 3) và K8s (ngày 7) trước, giữ nguyên phần chống mất tin.
+- **Test song song:** viết integration test bằng **Testcontainers** (Postgres + RabbitMQ) ngay từ ngày 5, đừng để dồn lại.
+- **Kiểm tra phiên bản:** chọn một phiên bản Spring Boot ổn định và bám theo nó, vì một số tài liệu trộn lẫn các bản khác nhau (ví dụ Spring Security 6 và 7).
+- **Bonus** nên coi là tuần 2 nếu tuần đầu chưa đạt "xong khi" của từng ngày.
+
+Bạn muốn mình dựng sẵn khung dự án (cấu trúc package, `pom.xml`, `docker-compose.yml` gồm DB, RabbitMQ, Keycloak) để bắt đầu ngày 1 luôn không?
