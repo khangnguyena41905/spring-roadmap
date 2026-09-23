@@ -1,0 +1,7 @@
+spring:
+  application:
+    name: how-to-init-spring
+  datasource:
+    url: jdbc:sqlserver://localhost:1433;databaseName=java-course;encrypt=false;trustServerCertificate=true
+    username: sa
+    password: Nguyenkhang@1905
