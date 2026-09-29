@@ -4,4 +4,9 @@ spring:
   datasource:
     url: jdbc:sqlserver://localhost:1433;databaseName=java-course;encrypt=false;trustServerCertificate=true
     username: sa
-    password: Nguyenkhang@1905
+    password: ${DB_PASSWORD:Qwe!@#123}
+
+app:
+  jwt:
+    secret: ${JWT_SECRET:ZGV2LW9ubHktc2VjcmV0LWtleS1hdC1sZWFzdC0zMi1ieXRlcy1sb25nISE=}
+    expiration-ms: 3600000
